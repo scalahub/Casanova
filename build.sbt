@@ -1,8 +1,11 @@
 name := "Casanova"
 
-version := "0.1"
+version := "1.0"
 
-scalaVersion := "2.13.2"
+ThisBuild / scalaVersion := "2.12.10"
+
+ThisBuild / crossScalaVersions := Seq(scalaVersion.value, "2.13.2")
+// use +publishLocal +publishSigned or  to publish all versions
 
 val CassandraDriverVersion = "4.5.0"
 

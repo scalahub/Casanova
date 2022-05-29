@@ -1,16 +1,15 @@
 package org.sh.casanova.cassandra
 
-import java.util.UUID
-
 import com.datastax.oss.driver.api.core.`type`.DataTypes._
 import com.datastax.oss.driver.api.core.cql.Row
+import org.scalatest.concurrent.Eventually.eventually
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpec}
 import org.scalatestplus.mockito.MockitoSugar
 import org.sh.casanova.cassandra.models.{History, HistoryT}
 
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext}
+import java.util.UUID
+import scala.concurrent.ExecutionContext
 
 case class DummyItem(id:String, name:String, age:Int)
 
@@ -23,10 +22,8 @@ object DummyItemStore {
 import org.sh.casanova.cassandra.CassandraStore._
 import org.sh.casanova.cassandra.DummyItemStore._
 
-class DummyItemStore(implicit ec:ExecutionContext) extends CassandraStore[DummyItem](EmbeddedCassandraHelper.session) {
+class DummyItemStore(implicit ec:ExecutionContext) extends CassandraStore[DummyItem]("dummy_keyspace", EmbeddedCassandraHelper.session) {
 
-  lazy val keySpace = "dummy_keyspace"
-  lazy val numberOfReplicas = 1
   lazy val baseTableName: String = "dummy"
   lazy val primaryKeys = Seq(
     PrimaryKey(Seq(idCol), Nil),
@@ -42,8 +39,8 @@ class DummyItemStore(implicit ec:ExecutionContext) extends CassandraStore[DummyI
     Ins(nameCol, (b:BS, d:DummyItem, i:Int) => b.setString(i, d.name)),
     Ins(ageCol, (b:BS, d:DummyItem, i:Int) => b.setInt(i, d.age))
   )
-  def get(id:String) = selectT(whr(idCol, Eq, id))
-  def delete(id:String, reason:String, deleteBy:String) = deleteT(whr(idCol, Eq, id))(reason, deleteBy)
+  def get(id:String) = selectWhere(idCol === id)
+  def delete(id:String, reason:String, deleteBy:String) = deleteWhere(idCol === id)(reason, deleteBy)
 }
 
 class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutures with Matchers
@@ -57,9 +54,13 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
 
   override def beforeAll(): Unit = {
     import dummyItemStore._
-    Await.result(createKeySpaceIfNotExists, 30.seconds)
-    Await.result(createHistoryTable, 30.seconds)
-    Await.result(createTables, 30.seconds)
+
+    import scala.concurrent.duration._
+    eventually(timeout(1.minutes), interval(5.seconds)) {
+      createSimpleKeySpaceIfNotExists.futureValue
+      createHistoryTable.futureValue
+      createTables.futureValue
+    }
   }
 
   "Insert" should {
@@ -102,15 +103,17 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
 
       val (dummyReason, dummyUpdateBy) = ("update", "test")
 
-      val dummyList = dummyItemStore.insertT(dummyItem).flatMap{ _ =>
-        dummyItemStore.delete(dummyId, dummyReason, dummyUpdateBy).flatMap{_ =>
-          dummyItemStore.get(dummyId).flatMap{list =>
-            list shouldBe (Nil)
-            dummyItemStore.selectHistoryT(whr(idCol, Eq, dummyId)).map{ w => w.map(_.t)}
-          }
-        }
+      val (list1, list2) = {
+        for {
+          _ <- dummyItemStore.insertT(dummyItem)
+          _ <- dummyItemStore.delete(dummyId, dummyReason, dummyUpdateBy)
+          list1 <- dummyItemStore.get(dummyId)
+          list2 <- dummyItemStore.selectHistoryWhere(idCol === dummyId).map{ w => w.map(_.t)}
+        } yield (list1, list2)
       }.futureValue
-      dummyList shouldBe (List(dummyItem, dummyItem))
+
+      list1 shouldBe Nil
+      list2 shouldBe List(dummyItem, dummyItem)
     }
   }
 
@@ -127,7 +130,7 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
         for {
           _ <- dummyItemStore.insertT(dummyItem)
           list1 <- dummyItemStore.get(dummyId)
-          _ <- dummyItemStore.updateT(set(ageCol, dummyItem1.age))(whr(idCol, Eq, dummyItem.id))(dummyReason, dummyUpdateBy)
+          _ <- dummyItemStore.updateT(set(ageCol, dummyItem1.age))(idCol === dummyItem.id)(dummyReason, dummyUpdateBy)
           list2 <- dummyItemStore.get(dummyId)
         } yield Seq(list1, list2)
       }.futureValue
@@ -146,17 +149,14 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
 
       val (dummyReason, dummyUpdateBy) = ("update", "test")
 
-
-      val lists =
-        dummyItemStore.insertT(dummyItem).flatMap{ _ =>
-          dummyItemStore.get(dummyId).flatMap{list1 =>
-            dummyItemStore.updateT(set(ageCol, 99))(whr(idCol, Eq, dummyId), whr(nameCol, Eq, dummyName))(dummyReason, dummyUpdateBy).flatMap{ bool =>
-              dummyItemStore.get(dummyId).map{list2 =>
-                Seq(list1, list2)
-              }
-            }
-          }
-        }.futureValue
+      val lists = {
+        for {
+          _ <- dummyItemStore.insertT(dummyItem)
+          list1 <- dummyItemStore.get(dummyId)
+          _ <- dummyItemStore.updateT(ageCol <-- 99)(idCol === dummyId, nameCol === dummyName)(dummyReason, dummyUpdateBy)
+          list2 <- dummyItemStore.get(dummyId)
+        } yield Seq(list1, list2)
+      }.futureValue
 
       lists(0) shouldBe (List(dummyItem))
       lists(1) shouldBe (List(dummyItem1))
@@ -179,12 +179,12 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
           _ <- dummyItemStore.insertT(dummyItem2)
           _ <- dummyItemStore.insertT(dummyItem3)
           _ <- dummyItemStore.insertT(dummyItem4)
-          all <- dummyItemStore.selectT()
-          list1 <- dummyItemStore.selectT(whr(idCol, Eq, dummyId1))
-          list2 <- dummyItemStore.selectT(whr(nameCol, Eq, dummyName2))
-          list3 <- dummyItemStore.selectT(whr(idCol, Eq, dummyId3), whr(nameCol, Eq, dummyName3))
-          list4 <- dummyItemStore.selectT(whr(idCol, Eq, dummyId3), whr(nameCol, Eq, dummyName1))
-          list5 <- dummyItemStore.selectT(whr(nameCol, Eq, dummyName3))
+          all <- dummyItemStore.selectWhere()
+          list1 <- dummyItemStore.selectWhere(whr(idCol, Eq, dummyId1))
+          list2 <- dummyItemStore.selectWhere(whr(nameCol, Eq, dummyName2))
+          list3 <- dummyItemStore.selectWhere(whr(idCol, Eq, dummyId3), whr(nameCol, Eq, dummyName3))
+          list4 <- dummyItemStore.selectWhere(whr(idCol, Eq, dummyId3), whr(nameCol, Eq, dummyName1))
+          list5 <- dummyItemStore.selectWhere(whr(nameCol, Eq, dummyName3))
         } yield Seq(all, list1, list2, list3, list4, list5)
       }.futureValue
       Set(dummyItem1, dummyItem2, dummyItem3, dummyItem4).subsetOf(lists(0).toSet) shouldBe (true)
@@ -214,8 +214,8 @@ class CassandraStoreSpec extends WordSpec with BeforeAndAfterAll with ScalaFutur
           _ <- dummyItemStore.updateT(set(ageCol, dummyAge1))(whr(idCol, Eq, dummyId))(dummyReason1, dummyUpdateBy1)
           _ <- dummyItemStore.updateT(set(ageCol, dummyAge2))(whr(idCol, Eq, dummyId))(dummyReason2, dummyUpdateBy2)
           _ <- dummyItemStore.updateT(set(ageCol, dummyAge3))(whr(idCol, Eq, dummyId))(dummyReason3, dummyUpdateBy3)
-          _ <- dummyItemStore.deleteT(whr(idCol, Eq, dummyId))(dummyReason4, dummyDeletedBy)
-          histories <- dummyItemStore.selectHistoryT(whr(idCol, Eq, dummyId))
+          _ <- dummyItemStore.deleteWhere(whr(idCol, Eq, dummyId))(dummyReason4, dummyDeletedBy)
+          histories <- dummyItemStore.selectHistoryWhere(whr(idCol, Eq, dummyId))
           list <- dummyItemStore.get(dummyId)
         } yield (list, histories)
       }.futureValue

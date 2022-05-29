@@ -7,7 +7,7 @@ See the example [here](https://github.com/scalahub/Casanova/blob/d950b1e66179497
 
 In summary, define your store as follows
 
-```scala
+```
 class DummyItemStore(session:CqlSession, implicit ec:ExecutionContext) extends CassandraStore[DummyItem](session) {
     
   // first define abstract vals and defs from CassandraStore
@@ -17,8 +17,8 @@ class DummyItemStore(session:CqlSession, implicit ec:ExecutionContext) extends C
   
   // the below line will create multiple tables, one for each primary key
   lazy val primaryKeys = Seq( 
-    PrimaryKey(Seq(idCol), Nil),
-    PrimaryKey(Seq(nameCol), Seq(idCol))
+    PrimaryKey(partitionKey = Seq(idCol), clusterKeys = Nil), // for first table
+    PrimaryKey(partitionKey = Seq(nameCol), clusterKeys = Seq(idCol)) // for second table, kept in sync with first
   ) 
   
   lazy val cols = Seq(Col(idCol, TEXT), Col(nameCol, TEXT), Col(ageCol, INT))

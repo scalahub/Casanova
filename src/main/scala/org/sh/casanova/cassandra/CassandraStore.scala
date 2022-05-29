@@ -77,15 +77,45 @@ object CassandraStore {
   class BetterAny(val a:Any) {def as[T] = a.asInstanceOf[T]} /* Shorthand for `asInstanceOf` so we can write val x = b.as[String], which is equivalent to val x = b.asInstanceOf[String] */
   implicit def anyToBetterAny(s: Any) = new BetterAny(s)
 
+  class BetterWhr(col:String) {
+    def === (data:Any) = {
+      data match {
+        case uuid: UUID => whr(col, Eq, uuid)
+        case int: Int => whr(col, Eq, int)
+        case string: String => whr(col, Eq, string)
+        case boolean: Boolean => whr(col, Eq, boolean)
+        case instant: Instant => whr(col, Eq, instant)
+      }
+    }
+  }
+  implicit def anyToBetterWhr(col: String) = new BetterWhr(col)
+
   case class Whr(colName:String, bS_Any_Index_To_BS: BS_Any_Index_To_BS, any:Any, op:Op = Eq)
 
+  def whr(col: String, op: Op, data: UUID) = Whr(col, (b:BS, a:Any, i:Int) => b.setUuid(i, a.as[UUID]), data, op)
   def whr(col: String, op: Op, data: String) = Whr(col, (b:BS, a:Any, i:Int) => b.setString(i, a.as[String]), data, op)
   def whr(col: String, op: Op, data: Instant) = Whr(col, (b:BS, a:Any, i:Int) => b.setInstant(i, a.as[Instant]), data, op)
   def whr(col: String, op: Op, data: Int) = Whr(col, (b:BS, a:Any, i:Int) => b.setInt(i, a.as[Int]), data, op)
   def whr(col: String, op: Op, data: Boolean) = Whr(col, (b:BS, a:Any, i:Int) => b.setBoolean(i, a.as[Boolean]), data, op)
 
+  class BetterSet(col:String) {
+    def <-- (data:Any) = {
+      data match {
+        case uuid: UUID => set(col, uuid)
+        case int: Int => set(col, int)
+        case string: String => set(col, string)
+        case boolean: Boolean => set(col, boolean)
+        case instant: Instant => set(col, instant)
+        case seqStr: Seq[String] => set(col, seqStr)
+        case instant: Instant => set(col, instant)
+      }
+    }
+  }
+  implicit def anyToBetterSet(col: String) = new BetterSet(col)
+
   case class Upd(colName:String, bS_Any_Index_To_BS: BS_Any_Index_To_BS, any:Any)
 
+  def set(col:String, data:UUID): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setUuid(i, a.as[UUID]), data)
   def set(col:String, data:String): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setString(i, a.as[String]), data)
   def set(col:String, data:Boolean): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setBoolean(i, a.as[Boolean]), data)
   def set(col:String, data:Instant): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setInstant(i, a.as[Instant]), data)
@@ -93,12 +123,16 @@ object CassandraStore {
   def set(col:String, data:Seq[String]): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setList(i, a.as[Seq[String]].asJava, classOf[String]), data)
   def set(col:String, data:Set[String]): Upd = Upd(col, (b:BS, a:Any, i:Int) => b.setSet(i, a.as[Set[String]].asJava, classOf[String]), data)
 
+
+      /*
+       Ideal syntax:
+        dummyItemStore.update(ageCol <-- 99).where(idCol === dummyId and nameCol === dummyName).reason("dummyReason").by("foo")
+        update(dummyItemStore).set(ageCol <-- 99).where(idCol === dummyId and nameCol === dummyName).reason("dummyReason").by("foo")
+       */
+
 }
 
-abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContext) {
-
-  val keySpace:String
-  val numberOfReplicas:Int
+abstract class CassandraStore[T](keySpace:String, session:CqlSession)(implicit ec:ExecutionContext) {
 
   class BetterStatement(stmt:Statement[_]) {
     def asBoolean = execAsync.map(_.wasApplied())
@@ -225,7 +259,7 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
   }
 
   def insertT(t:T): Future[Boolean] = {
-    selectT(wheresPriKeysT(t)(basePrimaryKeyNames): _*).flatMap{
+    selectWhere(wheresPriKeysT(t)(basePrimaryKeyNames): _*).flatMap{
       case Nil =>
         upsertT(t).flatMap{
           case true => insertHistory(HistoryT(t, History(Instant.now(), DueToCreateOperation, "create", "auto")))
@@ -273,14 +307,14 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
   }
 
   def afterCopyingToHistory[A](wheres:Seq[Whr], dueToOperation: String, updateReason:String, updateBy:String)(f: List[T] => A) = {
-    selectT(wheres : _*).map { items =>
+    selectWhere(wheres : _*).map { items =>
       insertAsHistories(items)(dueToOperation, updateReason, updateBy)
       f(items)
     }
   }
 
-  def batchUpdateA[A](updates:Seq[Upd],
-                      wheresUpdatesStart:Seq[(Seq[Whr], Either[UpdateStart, (T, DeleteSelection, InsertInto)])]
+  def batchUpdate[A](updates:Seq[Upd],
+                     wheresUpdatesStart:Seq[(Seq[Whr], Either[UpdateStart, (T, DeleteSelection, InsertInto)])]
                      ) = {
     wheresUpdatesStart.foldLeft(BatchStatement.builder(DefaultBatchType.LOGGED)){
       case (builder, (wheres, Left(updateStart))) =>
@@ -320,7 +354,7 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
             (newWheres, qry)
         }
       }
-      batchUpdateA(updates, wheresUpdateStart)
+      batchUpdate(updates, wheresUpdateStart)
     }.flatten
   }
 
@@ -347,9 +381,9 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
     setAnys(updSeqBsAnyIndexToBs ++ whereSeqBsAnyIndexToBs, updSeqAny ++ whereSeqAny, updateAfterWhere)
   }
 
-  def selectT(wheres:Whr*) = selectA(wheres, rowToT, selectFromT(wheres))
+  def selectWhere(wheres:Whr*) = selectA(wheres, rowToT, selectFromT(wheres))
 
-  def selectHistoryT(wheres:Whr*) = selectA(wheres, rowToHistoryT, selectFromHistoryT)
+  def selectHistoryWhere(wheres:Whr*) = selectA(wheres, rowToHistoryT, selectFromHistoryT)
 
   def countT(wheres:Whr*) = {
     val (colNameOps, seqBsAnyIndexToBs, anys) = splitWheres(wheres)
@@ -401,7 +435,7 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
   }
 
   /* Deletes from main table that stores instances of T */
-  def deleteT(wheres:Whr*)(reason:String, deleteBy:String) = {
+  def deleteWhere(wheres:Whr*)(reason:String, deleteBy:String) = {
     // copy to-be updated rows into history
     afterCopyingToHistory(wheres, DueToDeleteOperation, reason, deleteBy) {items =>
       // proceed with actual delete
@@ -420,10 +454,11 @@ abstract class CassandraStore[T](session:CqlSession)(implicit ec:ExecutionContex
 
   def createHistoryTable = createTableAny(historyTableName, historyPrimaryKey, historyTableCols)
 
-  def createKeySpaceIfNotExists = getBoundStatememt {
+  @deprecated("For simple (non-replicated) or testing usage only", "1.0")
+  def createSimpleKeySpaceIfNotExists = getBoundStatememt {
     SchemaBuilder.createKeyspace(keySpace)
       .ifNotExists()
-      .withSimpleStrategy(numberOfReplicas)
+      .withSimpleStrategy(1)
   }.asBoolean
 
   private def createTableAny(tableName:String, primaryKey: PrimaryKey, allCols:Seq[Col]) = {
